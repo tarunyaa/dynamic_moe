@@ -86,6 +86,11 @@ The framework automatically handles model loading, conversion, testing, and can 
 
 ### Running the Project
 
+#### Infrastructure
+
+It is recommended to run this project in a GPU-acceleratd environment. See this guide to launch and SSH into a GPU-accelerated EC2 instance: https://docs.google.com/document/d/1Hky7NQRuBwpyDnrvl4j9ksPi_ORabHdHzkXRHhqhxZg/edit?tab=t.0
+
+
 #### Running from Command Line
 
 To run the default conversion experiment:
