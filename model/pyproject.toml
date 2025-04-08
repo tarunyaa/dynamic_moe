@@ -1,19 +1,21 @@
-[tool.poetry]
-name = "dynamic-moe"
+[project]
+name = "model"
 version = "0.1.0"
 description = ""
-authors = ["Steven Su <hanqisu@sas.upenn.edu>"]
+authors = [
+    {name = "Your Name",email = "you@example.com"}
+]
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = ">=3.10"
-torch = ">=2.0.0"
-transformers = ">=4.30.0"
-numpy = ">=2.0.0"
-datasets = ">=2.14.0"
-accelerate = ">=0.21.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets (>=3.5.0,<4.0.0)",
+    "transformers (>=4.51.1,<5.0.0)",
+    "torch (>=2.6.0,<3.0.0)",
+    "tensorboard (>=2.19.0,<3.0.0)",
+    "zstandard (>=0.23.0,<0.24.0)"
+]
 
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
