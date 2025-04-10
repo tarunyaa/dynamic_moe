@@ -2,7 +2,7 @@ import os
 import time
 import random
 from transformers import AutoTokenizer
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, IterableDataset
 from tqdm import tqdm
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -17,7 +17,6 @@ class DataLoader:
         self,
         model_name="gpt2-xl",
         max_length=512,
-        subset_size=1_000_000,
         test_size=0.05,
         seed=42,
         data_dir="./data"
@@ -28,14 +27,12 @@ class DataLoader:
         Args:
             model_name: Name of the model for tokenization
             max_length: Maximum sequence length for tokenization
-            subset_size: Number of samples to collect from SlimPajama
             test_size: Proportion of data to use for validation
             seed: Random seed for reproducible splits
             data_dir: Directory to store data
         """
         self.model_name = model_name
         self.max_length = max_length
-        self.subset_size = subset_size
         self.test_size = test_size
         self.seed = seed
         self.data_dir = data_dir
@@ -55,58 +52,55 @@ class DataLoader:
     
     def get_slimpajama_data(self):
         """
-        Load and prepare SlimPajama dataset.
+        Load and prepare SlimPajama dataset in streaming mode.
         
         Returns:
-            Tuple of (train_dataset, eval_dataset)
+            Tuple of (train_dataset, eval_dataset) as streaming datasets
         """
-        print("Loading SlimPajama subset from Hugging Face...")
-        dataset = load_dataset(
-            "cerebras/SlimPajama-627B",
-            split="train",
-            streaming=True
-        )
-
-        samples = []
-        print(f"Collecting {self.subset_size} samples...")
+        print("Loading SlimPajama dataset in streaming mode...")
         
+        # Handle rate limiting with retries
         max_retries = 5
-        i = 0
-        pbar = tqdm(total=self.subset_size, desc="Streaming dataset")
-        
-        while i < self.subset_size:
+        for attempt in range(max_retries):
             try:
-                sample_iter = iter(dataset)
-                while i < self.subset_size:
-                    sample = next(sample_iter)
-                    samples.append(sample)
-                    i += 1
-                    pbar.update(1)
+                dataset = load_dataset(
+                    "cerebras/SlimPajama-627B", 
+                    split="train", 
+                    streaming=True
+                )
+                break
             except HfHubHTTPError as e:
-                if "429" in str(e) and max_retries > 0:
-                    retry_time = 2 ** (5 - max_retries) * (1 + random.random())
-                    max_retries -= 1
-                    print(f"\nRate limit hit. Retrying in {retry_time:.1f} seconds. Retries left: {max_retries}")
+                if "429" in str(e) and attempt < max_retries - 1:
+                    retry_time = 2 ** attempt * (1 + random.random())
+                    print(f"\nRate limit hit. Retrying in {retry_time:.1f} seconds. Retries left: {max_retries - attempt - 1}")
                     time.sleep(retry_time)
                 else:
-                    pbar.close()
                     raise
-            except Exception as e:
-                pbar.close()
-                raise
         
-        pbar.close()
-
-        print("Converting to Hugging Face Dataset...")
-        collected_dataset = Dataset.from_dict({
-            k: [sample[k] for sample in samples]
-            for k in samples[0].keys()
-        })
-
-        print("Splitting into train and validation...")
-        splits = collected_dataset.train_test_split(test_size=self.test_size, seed=self.seed)
-        self.train_dataset = splits['train']
-        self.eval_dataset = splits['test']
+        # For streaming datasets, we can use the IterableDatasets.shuffle method with a buffer_size
+        shuffled_dataset = dataset.shuffle(
+            buffer_size=10000,
+            seed=self.seed
+        )
+        
+        # Create train/validation split for streaming data
+        # Since we can't easily split a streaming dataset with exact proportions,
+        # we'll use a deterministic function based on a hash of the examples
+        def train_validation_split(example):
+            import hashlib
+            # Create a deterministic hash based on the content and our seed
+            text_hash = hashlib.md5((str(example['text']) + str(self.seed)).encode()).hexdigest()
+            # Convert first 8 chars of hash to int and decide split
+            hash_int = int(text_hash[:8], 16)
+            # If hash_int % 100 is less than test_size*100, it goes to validation
+            return 'validation' if hash_int % 100 < (self.test_size * 100) else 'train'
+        
+        # Split the dataset
+        train_dataset = shuffled_dataset.filter(lambda example: train_validation_split(example) == 'train')
+        eval_dataset = shuffled_dataset.filter(lambda example: train_validation_split(example) == 'validation')
+        
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
         return self.train_dataset, self.eval_dataset
 
     def preprocess_function(self, examples):
@@ -142,24 +136,22 @@ class DataLoader:
         if self.train_dataset is None or self.eval_dataset is None:
             self.get_slimpajama_data()
         
-        print("Tokenizing datasets...")
+        print("Tokenizing datasets in streaming mode...")
         tokenized_train = self.train_dataset.map(
             self.preprocess_function,
             batched=True,
             batch_size=16,
-            remove_columns=self.train_dataset.column_names,
-            desc="Tokenizing training data"
+            remove_columns=["text"],
         )
         
         tokenized_eval = self.eval_dataset.map(
             self.preprocess_function,
             batched=True,
             batch_size=16,
-            remove_columns=self.eval_dataset.column_names,
-            desc="Tokenizing validation data"
+            remove_columns=["text"],
         )
         
-        print(f"Prepared {len(tokenized_train)} training examples and {len(tokenized_eval)} validation examples")
+        print("Datasets prepared in streaming mode")
         
         self.train_dataset = tokenized_train
         self.eval_dataset = tokenized_eval
@@ -173,7 +165,7 @@ class DataLoader:
         Returns:
             Tuple of (train_dataset, eval_dataset)
         """
-        if self.train_dataset is None or "input_ids" not in self.train_dataset.features:
+        if self.train_dataset is None:
             print("Datasets not prepared yet. Preparing now...")
             self.prepare_datasets()
             
@@ -184,7 +176,6 @@ if __name__ == "__main__":
     loader = DataLoader(
         model_name="gpt2-xl",
         max_length=512,
-        subset_size=1_000_000,
         test_size=0.05,
     )
     
