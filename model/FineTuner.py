@@ -1,7 +1,7 @@
 import os
 import torch
 from transformers import Trainer, TrainingArguments
-from torch.utils.tensorboard import SummaryWriter
+import json
 
 
 class FineTuner:
@@ -19,7 +19,7 @@ class FineTuner:
         logging_dir="./logs",
         fp16=True,
         bf16=False,
-        report_to="tensorboard",
+        report_to="none",
         seed=42
     ):
         """
@@ -33,7 +33,7 @@ class FineTuner:
             logging_dir: Directory for logs
             fp16: Whether to use 16-bit floating point precision
             bf16: Whether to use bfloat16 precision (if supported)
-            report_to: Logging backend ("tensorboard", "wandb", etc.)
+            report_to: Logging backend ("none" by default)
             seed: Random seed for reproducibility
         """
         self.model = model
@@ -57,9 +57,9 @@ class FineTuner:
     def create_training_args(
         self,
         num_train_epochs=3,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=32,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=64,
         evaluation_strategy="steps",
         eval_steps=1000,
         logging_steps=100,
@@ -71,7 +71,7 @@ class FineTuner:
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         gradient_checkpointing=True,
-        dataloader_num_workers=2,
+        dataloader_num_workers=1,
         dataloader_pin_memory=True,
         max_grad_norm=0.3,
         load_best_model_at_end=True,
@@ -92,7 +92,7 @@ class FineTuner:
             per_device_train_batch_size=per_device_train_batch_size,
             per_device_eval_batch_size=per_device_eval_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            evaluation_strategy=evaluation_strategy,
+            eval_strategy=evaluation_strategy,
             eval_steps=eval_steps,
             logging_dir=self.logging_dir,
             logging_steps=logging_steps,
@@ -194,7 +194,7 @@ class FineTuner:
     
     def save_model(self, output_dir=None):
         """
-        Save the fine-tuned model.
+        Save the fine-tuned model with MoE layers.
         
         Args:
             output_dir: Directory to save the model or None for default
@@ -209,9 +209,99 @@ class FineTuner:
             raise ValueError("Trainer not set up. Nothing to save.")
         
         output_dir = output_dir or os.path.join(self.output_dir, "final_model")
+        os.makedirs(output_dir, exist_ok=True)
         print(f"\nSaving model to {output_dir}")
-        self.trainer.save_model(output_dir)
+        
+        # 1. Save the model state dict directly using PyTorch
+        torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+        
+        # 2. Save model config (if available)
+        if hasattr(self.model, 'config'):
+            self.model.config.save_pretrained(output_dir)
+        
+        # 3. Save tokenizer separately (if available via trainer)
+        if hasattr(self.trainer, 'tokenizer') and self.trainer.tokenizer is not None:
+            self.trainer.tokenizer.save_pretrained(output_dir)
+        
+        # 4. Save MoE configuration info for reloading
+        moe_config = self._get_moe_config()
+        with open(os.path.join(output_dir, "moe_config.json"), 'w') as f:
+            json.dump(moe_config, f, indent=2)
+        
         return output_dir
+    
+    def _get_moe_config(self):
+        """
+        Extract MoE configuration from the model.
+        
+        Returns:
+            Dictionary containing MoE configuration
+        """
+        # Default MoE configuration
+        moe_config = {
+            "base_model": "gpt2-xl",  # Default assumption
+            "moe_layers": []
+        }
+        
+        # Try to extract MoE information
+        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            moe_layers = []
+            for i, layer in enumerate(self.model.transformer.h):
+                if hasattr(layer, 'mlp') and 'MixtureOfExperts' in str(type(layer.mlp)):
+                    # Found MoE layer
+                    moe_layer_info = {
+                        "layer_idx": i,
+                        "num_experts": layer.mlp.num_experts,
+                        "top_k": layer.mlp.top_k
+                    }
+                    moe_layers.append(moe_layer_info)
+            
+            moe_config["moe_layers"] = moe_layers
+            
+            # Try to determine original model name
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'model_type'):
+                moe_config["base_model"] = self.model.config.model_type
+        
+        return moe_config
+    
+    def load_model(self, model_path):
+        """
+        Load a saved model with MoE layers.
+        
+        Args:
+            model_path: Path to the saved model
+            
+        Returns:
+            Loaded model
+        """
+        from architecture.GPT2MoEBlock import GPT2MoEBlock
+        from ModelConverter import ModelConverter
+        
+        # Check if MoE config exists
+        moe_config_path = os.path.join(model_path, "moe_config.json")
+        if not os.path.exists(moe_config_path):
+            raise ValueError(f"MoE configuration not found at {moe_config_path}")
+        
+        # Load MoE configuration
+        with open(moe_config_path, 'r') as f:
+            moe_config = json.load(f)
+        
+        # Initialize a base model first
+        base_model_name = moe_config.get("base_model", "gpt2-xl")
+        converter = ModelConverter(model_name=base_model_name)
+        model, _ = converter.load_model()
+        
+        # Load the state dict
+        state_dict_path = os.path.join(model_path, "pytorch_model.bin")
+        if not os.path.exists(state_dict_path):
+            raise ValueError(f"Model weights not found at {state_dict_path}")
+        
+        state_dict = torch.load(state_dict_path, map_location=converter.device)
+        model.load_state_dict(state_dict)
+        
+        print(f"Successfully loaded model from {model_path}")
+        self.model = model
+        return model
     
     def set_model(self, model):
         """Set the model to be fine-tuned."""
@@ -226,40 +316,6 @@ class FineTuner:
         if self.trainer is not None:
             self.trainer.train_dataset = train_dataset
             self.trainer.eval_dataset = eval_dataset
-            
-    def launch_tensorboard(self, port=6006):
-        """
-        Launch TensorBoard to visualize training metrics.
-        
-        Args:
-            port: Port to serve TensorBoard on (default: 6006)
-            
-        Returns:
-            TensorBoard instance
-        """
-        try:
-            from tensorboard import program
-            import webbrowser
-            import threading
-            import time
-            
-            # Start TensorBoard server
-            tb = program.TensorBoard()
-            tb.configure(argv=[None, '--logdir', self.logging_dir, '--port', str(port)])
-            url = tb.launch()
-            print(f"\n========== TENSORBOARD ==========")
-            print(f"TensorBoard started at {url}")
-            print(f"View training metrics at: http://localhost:{port}")
-            
-            # Open browser automatically
-            threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-            
-            return tb
-        except ImportError:
-            print("\nTo use TensorBoard, install it with: pip install tensorboard")
-            print("\nAfter installation, you can view training metrics with:")
-            print(f"tensorboard --logdir {self.logging_dir}")
-            return None
 
 
 # Example usage when run directly
@@ -271,26 +327,27 @@ if __name__ == "__main__":
     converter = ModelConverter(model_name="gpt2-xl")
     model, _ = converter.convert_layers()
     
-    # Load datasets
-    data_loader = DataLoader(model_name="gpt2-xl", subset_size=1000000)
+    # Load datasets in streaming mode
+    data_loader = DataLoader(model_name="gpt2-xl")
     train_dataset, eval_dataset = data_loader.prepare_datasets()
     
-    # Create fine-tuner with lower epochs for testing
+    # Create fine-tuner with reduced memory usage
     tuner = FineTuner(
         model=model,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset
+        eval_dataset=eval_dataset,
+        fp16=False  # Disable fp16 to reduce memory usage
     )
     
-    # Custom training args for testing
+    # Custom training args - adjusted for memory constraints
     tuner.create_training_args(
         num_train_epochs=1,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=64, 
         eval_steps=500,
-        save_steps=500
+        save_steps=500,
+        max_steps=5000,  # Reduced from 15000 to 5000
     )
-    
-    # Start TensorBoard before training (optional)
-    tuner.launch_tensorboard()
     
     # Train and save model
     tuner.train()
