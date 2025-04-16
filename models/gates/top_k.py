@@ -1,7 +1,8 @@
 from gates.expert_gate import ExpertGate
+import torch
 
 class TopKGate(ExpertGate):
-    def __init__(self, top_k=2):
+    def __init__(self, top_k):
         super().__init__()
         self.top_k = top_k
 
