@@ -1,4 +1,5 @@
 from gates.expert_gate import ExpertGate
+import torch
 
 class TopPGate(ExpertGate):
     def __init__(self, top_p=0.9):
