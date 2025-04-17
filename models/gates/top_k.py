@@ -1,40 +1,50 @@
+# gates/top_k.py
+
 from gates.expert_gate import ExpertGate
 import torch
+from gates.load_balance import load_balancing_loss
 
 class TopKGate(ExpertGate):
-    def __init__(self, top_k):
+    def __init__(self, top_k: int):
         super().__init__()
         self.top_k = top_k
 
-    def forward(self, routing_weights, expert_outputs_list):
+    def forward(self, routing_weights: torch.Tensor, expert_outputs_list: list[torch.Tensor]):
         """
         Args:
-            routing_weights: Tensor of shape [B, T, E] — softmax probabilities
-            expert_outputs_list: List of expert outputs, each [B, T, D]
-
+            routing_weights: [B, T, E] — softmax probabilities
+            expert_outputs_list: list of E tensors [B, T, D]
         Returns:
-            final_output: Tensor [B, T, D]
-            aux_loss: optional regularization (currently zero)
+            final_output: [B, T, D]
+            lb_loss: scalar load‑balancing loss
         """
-        batch_size, seq_len, num_experts = routing_weights.shape
+        B, T, E = routing_weights.shape
+        D = expert_outputs_list[0].shape[-1]
         device = routing_weights.device
-        input_dim = expert_outputs_list[0].shape[-1]
 
-        # Step 1: Select top-k experts per token
-        topk_weights, topk_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)  # [B, T, k]
+        # 1) pick top‑k per token
+        topk_w, topk_i = torch.topk(routing_weights, self.top_k, dim=-1)   # [B, T, k]
+        topk_w = topk_w / (topk_w.sum(-1, keepdim=True) + 1e-9)
 
-        # Step 2: Weighted combination
-        final_output = torch.zeros((batch_size, seq_len, input_dim), device=device)
-
+        # 2) assemble output
+        out = torch.zeros((B, T, D), device=device)
         for k in range(self.top_k):
-            expert_idx = topk_indices[:, :, k]     # [B, T]
-            weight = topk_weights[:, :, k]         # [B, T]
+            idx = topk_i[:, :, k]      # [B, T]
+            w   = topk_w[:, :, k]      # [B, T]
+            for e in range(E):
+                mask = (idx == e).unsqueeze(-1)  # [B, T, 1]
+                out += mask * w.unsqueeze(-1) * expert_outputs_list[e]
 
-            for e in range(num_experts):
-                mask = (expert_idx == e).unsqueeze(-1)       # [B, T, 1]
-                expert_output = expert_outputs_list[e]       # [B, T, D]
-                final_output += mask * weight.unsqueeze(-1) * expert_output
+        # 3) build dispatch mask for LB
+        # shape [B, T, E], True where token→expert
+        expert_mask = torch.zeros_like(routing_weights, dtype=torch.bool)
+        expert_mask.scatter_(2, topk_i, True)
 
-        aux_loss = torch.tensor(0.0, device=device)  # placeholder for load balancing
-        return final_output, aux_loss
+        # 4) flatten to [B*T, E]
+        gate_flat = routing_weights.view(-1, E)
+        mask_flat = expert_mask.view(-1, E)
+
+        # 5) compute LB loss
+        lb_loss = load_balancing_loss(gate_flat, mask_flat)
+
+        return out, lb_loss
