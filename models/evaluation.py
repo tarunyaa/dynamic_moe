@@ -82,12 +82,30 @@ class ModelEvaluator:
         """Extract expert usage statistics from model outputs."""
         expert_usage = {}
         
-        # Extract expert routing information from model outputs
-        if hasattr(model_outputs, 'expert_weights'):
-            expert_weights = model_outputs.expert_weights
-            expert_usage['weights'] = expert_weights
-            expert_usage['num_experts'] = expert_weights.shape[-1]
-            expert_usage['active_experts'] = (expert_weights > 0.1).sum(dim=-1)
+        try:
+            # Check for expert weights in different possible locations
+            if hasattr(model_outputs, 'expert_weights'):
+                expert_weights = model_outputs.expert_weights
+            elif hasattr(model_outputs, 'last_hidden_state') and hasattr(model_outputs.last_hidden_state, 'expert_weights'):
+                expert_weights = model_outputs.last_hidden_state.expert_weights
+            elif isinstance(model_outputs, dict) and 'expert_weights' in model_outputs:
+                expert_weights = model_outputs['expert_weights']
+            else:
+                logger.warning("No expert weights found in model outputs")
+                return expert_usage
+            
+            # Process expert weights
+            if isinstance(expert_weights, torch.Tensor):
+                expert_usage['weights'] = expert_weights
+                expert_usage['num_experts'] = expert_weights.shape[-1]
+                # Count experts with weight > 0.1 as active
+                expert_usage['active_experts'] = (expert_weights > 0.1).sum(dim=-1)
+                logger.debug(f"Found {expert_usage['num_experts']} experts")
+            else:
+                logger.warning(f"Expert weights is not a tensor: {type(expert_weights)}")
+            
+        except Exception as e:
+            logger.warning(f"Error extracting expert usage: {str(e)}")
         
         return expert_usage
 
@@ -131,74 +149,11 @@ class ModelEvaluator:
         tokenizer, model = self._prepare_model(model_id)
         metrics = {}
         
-        if self.task_type == "gsm8k":
-            # GSM8K-specific metrics
-            total = 0
-            correct = 0
-            step_accuracy = 0
-            total_steps = 0
-            
-            for i in tqdm(range(0, len(self.dataset), self.batch_size),
-                         desc=f"Computing GSM8K accuracy for {model_id}"):
-                batch = self.dataset[i:i + self.batch_size]
-                questions = batch['question']
-                answers = batch['answer']
-                
-                try:
-                    # Format the prompt for GSM8K
-                    prompts = [f"Question: {q}\nLet's think step by step.\n" for q in questions]
-                    
-                    encoded = tokenizer(
-                        prompts,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.max_length,
-                        padding=True
-                    ).to(self.device)
-                    
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **encoded,
-                            max_length=self.max_length,
-                            num_return_sequences=1,
-                            temperature=0.7,
-                            do_sample=True
-                        )
-                        
-                        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                        
-                        # Evaluate each response
-                        for gen_text, true_answer in zip(generated_texts, answers):
-                            # Extract the final answer from generated text
-                            gen_answer = self._extract_final_answer(gen_text)
-                            # Extract the final answer from true answer
-                            true_final = self._extract_final_answer(true_answer)
-                            
-                            if gen_answer and true_final:
-                                total += 1
-                                if self._compare_answers(gen_answer, true_final):
-                                    correct += 1
-                                
-                                # Count correct steps
-                                gen_steps = self._extract_steps(gen_text)
-                                true_steps = self._extract_steps(true_answer)
-                                if gen_steps and true_steps:
-                                    step_matches = sum(1 for g, t in zip(gen_steps, true_steps) 
-                                                     if self._compare_answers(g, t))
-                                    step_accuracy += step_matches
-                                    total_steps += len(true_steps)
-                            
-                except Exception as e:
-                    logger.warning(f"Error processing batch {i}: {str(e)}")
-                    continue
-            
-            if total > 0:
-                metrics['final_answer_accuracy'] = correct / total
-            if total_steps > 0:
-                metrics['step_accuracy'] = step_accuracy / total_steps
-                
+        if self.task_type == "qa":
+            # Implement QA-specific metrics (F1, exact match)
+            pass
         else:
-            # Original language modeling metrics
+            # Language modeling metrics
             total = 0
             correct = 0
             
@@ -234,40 +189,6 @@ class ModelEvaluator:
             metrics['token_accuracy'] = correct / total if total > 0 else 0.0
         
         return metrics
-
-    def _extract_final_answer(self, text: str) -> str:
-        """Extract the final answer from GSM8K response."""
-        # Look for the final answer after "####" or "Answer:"
-        if "####" in text:
-            return text.split("####")[-1].strip()
-        elif "Answer:" in text:
-            return text.split("Answer:")[-1].strip()
-        return ""
-
-    def _extract_steps(self, text: str) -> List[str]:
-        """Extract individual steps from GSM8K response."""
-        steps = []
-        # Split by newlines and look for lines that contain numbers or calculations
-        for line in text.split('\n'):
-            if any(c.isdigit() for c in line) and ('=' in line or '+' in line or '-' in line or '*' in line or '/' in line):
-                steps.append(line.strip())
-        return steps
-
-    def _compare_answers(self, ans1: str, ans2: str) -> bool:
-        """Compare two answers, handling different formats."""
-        # Extract numbers from both answers
-        import re
-        nums1 = re.findall(r'[-+]?\d*\.\d+|\d+', ans1)
-        nums2 = re.findall(r'[-+]?\d*\.\d+|\d+', ans2)
-        
-        if not nums1 or not nums2:
-            return False
-            
-        # Compare the last number in each answer (usually the final result)
-        try:
-            return abs(float(nums1[-1]) - float(nums2[-1])) < 1e-6
-        except ValueError:
-            return False
 
     def compute_efficiency_metrics(self, model_id: str) -> Dict[str, float]:
         """Compute efficiency metrics including expert usage and inference time."""

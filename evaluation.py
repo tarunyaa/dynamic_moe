@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from scipy import stats
 import psutil
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,8 +26,7 @@ class ModelEvaluator:
         dataset: Dataset,
         max_length: int = 512,
         batch_size: int = 8,
-        device: Optional[str] = None,
-        task_type: str = "language_modeling"  # or "qa"
+        device: Optional[str] = None
     ):
         """
         Initialize the ModelEvaluator with models and dataset.
@@ -37,21 +37,28 @@ class ModelEvaluator:
             max_length: Maximum sequence length for evaluation
             batch_size: Batch size for evaluation
             device: Device to run evaluation on (cuda/cpu)
-            task_type: Type of task ("language_modeling" or "qa")
         """
         self.models = models
         self.dataset = dataset
         self.max_length = max_length
         self.batch_size = batch_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.task_type = task_type
         self.results = defaultdict(dict)
-        
+
     def _prepare_model(self, model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
         """Load and prepare model and tokenizer."""
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            ).to(self.device)
             model.eval()
             
             # Set up padding token if not already set
@@ -83,226 +90,47 @@ class ModelEvaluator:
         """Extract expert usage statistics from model outputs."""
         expert_usage = {}
         
-        # Extract expert routing information from model outputs
-        if hasattr(model_outputs, 'expert_weights'):
-            expert_weights = model_outputs.expert_weights
-            expert_usage['weights'] = expert_weights
-            expert_usage['num_experts'] = expert_weights.shape[-1]
-            expert_usage['active_experts'] = (expert_weights > 0.1).sum(dim=-1)
+        try:
+            # Check for expert weights in different possible locations
+            if hasattr(model_outputs, 'expert_weights'):
+                expert_weights = model_outputs.expert_weights
+            elif hasattr(model_outputs, 'last_hidden_state') and hasattr(model_outputs.last_hidden_state, 'expert_weights'):
+                expert_weights = model_outputs.last_hidden_state.expert_weights
+            elif isinstance(model_outputs, dict) and 'expert_weights' in model_outputs:
+                expert_weights = model_outputs['expert_weights']
+            else:
+                logger.warning("No expert weights found in model outputs")
+                return expert_usage
+            
+            # Process expert weights
+            if isinstance(expert_weights, torch.Tensor):
+                expert_usage['weights'] = expert_weights
+                expert_usage['num_experts'] = expert_weights.shape[-1]
+                # Count experts with weight > 0.1 as active
+                expert_usage['active_experts'] = (expert_weights > 0.1).sum(dim=-1)
+                logger.debug(f"Found {expert_usage['num_experts']} experts")
+            else:
+                logger.warning(f"Expert weights is not a tensor: {type(expert_weights)}")
+            
+        except Exception as e:
+            logger.warning(f"Error extracting expert usage: {str(e)}")
         
         return expert_usage
 
-    def compute_perplexity(self, model_id: str) -> float:
-        """Compute perplexity score for a model."""
+    def compute_accuracy_metrics(self, model_id: str) -> Dict[str, float]:
+        """Compute accuracy metrics for language modeling."""
         tokenizer, model = self._prepare_model(model_id)
-        total_loss = 0.0
-        total_tokens = 0
+        metrics = {}
         
-        for i in tqdm(range(0, len(self.dataset), self.batch_size), 
-                     desc=f"Computing perplexity for {model_id}"):
+        total = 0
+        correct = 0
+        
+        for i in tqdm(range(0, len(self.dataset), self.batch_size),
+                     desc=f"Computing accuracy for {model_id}"):
             batch = self.dataset[i:i + self.batch_size]
             texts = batch['text']
             
             try:
-                inputs = tokenizer(
-                    texts,
-                    return_tensors='pt',
-                    truncation=True,
-                    max_length=self.max_length,
-                    padding=True
-                ).to(self.device)
-                
-                with torch.no_grad():
-                    outputs = model(**inputs, labels=inputs['input_ids'])
-                    loss = outputs.loss
-                    n_tokens = inputs['input_ids'].numel()
-                    total_loss += loss.item() * n_tokens
-                    total_tokens += n_tokens
-                    
-            except Exception as e:
-                logger.warning(f"Error processing batch {i}: {str(e)}")
-                continue
-        
-        avg_neg_log_likelihood = total_loss / total_tokens
-        perplexity = math.exp(avg_neg_log_likelihood)
-        return perplexity
-
-    def compute_accuracy_metrics(self, model_id: str) -> Dict[str, float]:
-        """Compute accuracy metrics based on task type."""
-        tokenizer, model = self._prepare_model(model_id)
-        metrics = {}
-        
-        if self.task_type == "gsm8k":
-            # GSM8K-specific metrics
-            total = 0
-            correct = 0
-            step_accuracy = 0
-            total_steps = 0
-            
-            for i in tqdm(range(0, len(self.dataset), self.batch_size),
-                         desc=f"Computing GSM8K accuracy for {model_id}"):
-                batch = self.dataset[i:i + self.batch_size]
-                questions = batch['question']
-                answers = batch['answer']
-                
-                try:
-                    # Format the prompt for GSM8K
-                    prompts = [f"Question: {q}\nLet's think step by step.\n" for q in questions]
-                    
-                    encoded = tokenizer(
-                        prompts,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.max_length,
-                        padding=True
-                    ).to(self.device)
-                    
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **encoded,
-                            max_length=self.max_length,
-                            num_return_sequences=1,
-                            temperature=0.7,
-                            do_sample=True
-                        )
-                        
-                        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                        
-                        # Evaluate each response
-                        for gen_text, true_answer in zip(generated_texts, answers):
-                            # Extract the final answer from generated text
-                            gen_answer = self._extract_final_answer(gen_text)
-                            # Extract the final answer from true answer
-                            true_final = self._extract_final_answer(true_answer)
-                            
-                            if gen_answer and true_final:
-                                total += 1
-                                if self._compare_answers(gen_answer, true_final):
-                                    correct += 1
-                                
-                                # Count correct steps
-                                gen_steps = self._extract_steps(gen_text)
-                                true_steps = self._extract_steps(true_answer)
-                                if gen_steps and true_steps:
-                                    step_matches = sum(1 for g, t in zip(gen_steps, true_steps) 
-                                                     if self._compare_answers(g, t))
-                                    step_accuracy += step_matches
-                                    total_steps += len(true_steps)
-                            
-                except Exception as e:
-                    logger.warning(f"Error processing batch {i}: {str(e)}")
-                    continue
-            
-            if total > 0:
-                metrics['final_answer_accuracy'] = correct / total
-            if total_steps > 0:
-                metrics['step_accuracy'] = step_accuracy / total_steps
-                
-        else:
-            # Original language modeling metrics
-            total = 0
-            correct = 0
-            
-            for i in tqdm(range(0, len(self.dataset), self.batch_size),
-                         desc=f"Computing accuracy for {model_id}"):
-                batch = self.dataset[i:i + self.batch_size]
-                texts = batch['text']
-                
-                try:
-                    encoded = tokenizer(
-                        texts,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.max_length,
-                        padding=True
-                    ).to(self.device)
-                    
-                    input_ids = encoded["input_ids"]
-                    labels = input_ids.clone()
-                    
-                    with torch.no_grad():
-                        outputs = model(**encoded)
-                        logits = outputs.logits
-                        predictions = torch.argmax(logits, dim=-1)
-                        
-                        correct += (predictions[:, 1:] == labels[:, 1:]).sum().item()
-                        total += labels[:, 1:].numel()
-                        
-                except Exception as e:
-                    logger.warning(f"Error processing batch {i}: {str(e)}")
-                    continue
-            
-            metrics['token_accuracy'] = correct / total if total > 0 else 0.0
-        
-        return metrics
-
-    def _extract_final_answer(self, text: str) -> str:
-        """Extract the final answer from GSM8K response."""
-        # Look for the final answer after "####" or "Answer:"
-        if "####" in text:
-            return text.split("####")[-1].strip()
-        elif "Answer:" in text:
-            return text.split("Answer:")[-1].strip()
-        return ""
-
-    def _extract_steps(self, text: str) -> List[str]:
-        """Extract individual steps from GSM8K response."""
-        steps = []
-        # Split by newlines and look for lines that contain numbers or calculations
-        for line in text.split('\n'):
-            if any(c.isdigit() for c in line) and ('=' in line or '+' in line or '-' in line or '*' in line or '/' in line):
-                steps.append(line.strip())
-        return steps
-
-    def _compare_answers(self, ans1: str, ans2: str) -> bool:
-        """Compare two answers, handling different formats."""
-        # Extract numbers from both answers
-        import re
-        nums1 = re.findall(r'[-+]?\d*\.\d+|\d+', ans1)
-        nums2 = re.findall(r'[-+]?\d*\.\d+|\d+', ans2)
-        
-        if not nums1 or not nums2:
-            return False
-            
-        # Compare the last number in each answer (usually the final result)
-        try:
-            return abs(float(nums1[-1]) - float(nums2[-1])) < 1e-6
-        except ValueError:
-            return False
-
-    def compute_efficiency_metrics(self, model_id: str) -> Dict[str, float]:
-        """Compute efficiency metrics including expert usage and inference time."""
-        tokenizer, model = self._prepare_model(model_id)
-        metrics = {}
-        
-        # Track expert usage
-        total_experts_used = 0
-        total_tokens = 0
-        inference_times = []
-        memory_usage = []
-        
-        for i in tqdm(range(0, len(self.dataset), self.batch_size),
-                     desc=f"Computing efficiency metrics for {model_id}"):
-            batch = self.dataset[i:i + self.batch_size]
-            
-            try:
-                # Get input texts based on task type
-                if self.task_type == "gsm8k":
-                    texts = [f"Question: {q}\nLet's think step by step.\n" for q in batch['question']]
-                else:
-                    texts = batch['text']
-                
-                # Measure memory before inference
-                if torch.cuda.is_available():
-                    torch.cuda.reset_peak_memory_stats()
-                    memory_before = torch.cuda.memory_allocated()
-                else:
-                    process = psutil.Process(os.getpid())
-                    memory_before = process.memory_info().rss
-                
-                # Time inference
-                start_time = time.time()
-                
                 encoded = tokenizer(
                     texts,
                     return_tensors="pt",
@@ -311,52 +139,22 @@ class ModelEvaluator:
                     padding=True
                 ).to(self.device)
                 
+                input_ids = encoded["input_ids"]
+                labels = input_ids.clone()
+                
                 with torch.no_grad():
-                    if self.task_type == "gsm8k":
-                        # For GSM8K, we use generate
-                        outputs = model.generate(
-                            **encoded,
-                            max_length=self.max_length,
-                            num_return_sequences=1,
-                            temperature=0.7,
-                            do_sample=True
-                        )
-                    else:
-                        # For other tasks, we use forward pass
-                        outputs = model(**encoded)
+                    outputs = model(**encoded)
+                    logits = outputs.logits
+                    predictions = torch.argmax(logits, dim=-1)
                     
-                    # Get expert usage if available
-                    expert_usage = self._get_expert_usage(outputs)
-                    if expert_usage:
-                        total_experts_used += expert_usage['active_experts'].sum().item()
-                        total_tokens += expert_usage['active_experts'].numel()
-                
-                # Measure memory after inference
-                if torch.cuda.is_available():
-                    memory_after = torch.cuda.max_memory_allocated()
-                else:
-                    memory_after = process.memory_info().rss
-                
-                inference_time = time.time() - start_time
-                inference_times.append(inference_time)
-                memory_usage.append(memory_after - memory_before)
-                
+                    correct += (predictions[:, 1:] == labels[:, 1:]).sum().item()
+                    total += labels[:, 1:].numel()
+                    
             except Exception as e:
                 logger.warning(f"Error processing batch {i}: {str(e)}")
                 continue
         
-        # Calculate metrics
-        if total_tokens > 0:
-            metrics['avg_experts_per_token'] = total_experts_used / total_tokens
-        
-        if inference_times:
-            metrics['avg_inference_time'] = np.mean(inference_times)
-            metrics['std_inference_time'] = np.std(inference_times)
-        
-        if memory_usage:
-            metrics['avg_memory_usage'] = np.mean(memory_usage)
-            metrics['max_memory_usage'] = np.max(memory_usage)
-        
+        metrics['token_accuracy'] = correct / total if total > 0 else 0.0
         return metrics
 
     def compute_adaptive_behavior_metrics(self, model_id: str) -> Dict[str, float]:
@@ -385,18 +183,16 @@ class ModelEvaluator:
                 with torch.no_grad():
                     outputs = model(**encoded)
                     
-                    # Get expert usage
+                    # Get expert usage if available
                     expert_usage = self._get_expert_usage(outputs)
-                    if expert_usage:
-                        expert_usage_per_sample.extend(
-                            expert_usage['active_experts'].mean(dim=1).cpu().numpy()
-                        )
+                    if expert_usage and 'active_experts' in expert_usage:
+                        # Average expert usage across the sequence
+                        avg_expert_usage = expert_usage['active_experts'].mean(dim=1).cpu().numpy()
+                        expert_usage_per_sample.extend(avg_expert_usage)
+                        logger.debug(f"Sample expert usage: {avg_expert_usage}")
                     
-                    # Estimate input difficulty (e.g., using entropy of predictions)
-                    logits = outputs.logits
-                    probs = F.softmax(logits, dim=-1)
-                    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
-                    input_difficulties.extend(entropy.mean(dim=1).cpu().numpy())
+                    # Use sequence length as a proxy for difficulty
+                    input_difficulties.extend([len(t.split()) for t in texts])
                 
             except Exception as e:
                 logger.warning(f"Error processing batch {i}: {str(e)}")
@@ -404,15 +200,24 @@ class ModelEvaluator:
         
         # Calculate correlation between input difficulty and expert usage
         if expert_usage_per_sample and input_difficulties:
-            correlation = stats.pearsonr(input_difficulties, expert_usage_per_sample)[0]
-            metrics['difficulty_expert_correlation'] = correlation
+            try:
+                correlation = stats.pearsonr(input_difficulties, expert_usage_per_sample)[0]
+                metrics['difficulty_expert_correlation'] = correlation
+                logger.info(f"Difficulty-expert correlation: {correlation:.4f}")
+            except Exception as e:
+                logger.warning(f"Error calculating correlation: {str(e)}")
         
         # Calculate expert usage distribution metrics
         if expert_usage_per_sample:
-            expert_usage = np.array(expert_usage_per_sample)
-            metrics['expert_usage_mean'] = expert_usage.mean()
-            metrics['expert_usage_std'] = expert_usage.std()
-            metrics['expert_usage_entropy'] = stats.entropy(np.histogram(expert_usage, bins=20)[0])
+            try:
+                expert_usage = np.array(expert_usage_per_sample)
+                metrics['expert_usage_mean'] = expert_usage.mean()
+                metrics['expert_usage_std'] = expert_usage.std()
+                metrics['expert_usage_entropy'] = stats.entropy(np.histogram(expert_usage, bins=20)[0])
+                logger.info(f"Expert usage stats - Mean: {metrics['expert_usage_mean']:.4f}, "
+                          f"Std: {metrics['expert_usage_std']:.4f}")
+            except Exception as e:
+                logger.warning(f"Error calculating expert usage stats: {str(e)}")
         
         return metrics
 
@@ -427,13 +232,6 @@ class ModelEvaluator:
                 self.results[model_name].update(accuracy_metrics)
             except Exception as e:
                 logger.error(f"Error computing accuracy metrics for {model_name}: {str(e)}")
-            
-            # Compute efficiency metrics
-            try:
-                efficiency_metrics = self.compute_efficiency_metrics(model_id)
-                self.results[model_name].update(efficiency_metrics)
-            except Exception as e:
-                logger.error(f"Error computing efficiency metrics for {model_name}: {str(e)}")
             
             # Compute adaptive behavior metrics
             try:
@@ -452,8 +250,7 @@ class ModelEvaluator:
         
         # Group metrics by category
         metric_categories = {
-            'Accuracy & Performance': ['token_accuracy', 'perplexity'],
-            'Efficiency': ['avg_experts_per_token', 'avg_inference_time', 'avg_memory_usage'],
+            'Accuracy & Performance': ['token_accuracy'],
             'Adaptive Behavior': ['difficulty_expert_correlation', 'expert_usage_entropy']
         }
         
@@ -498,8 +295,7 @@ class ModelEvaluator:
         
         # Group metrics by category
         metric_categories = {
-            'Accuracy & Performance': ['token_accuracy', 'perplexity'],
-            'Efficiency': ['avg_experts_per_token', 'avg_inference_time', 'avg_memory_usage'],
+            'Accuracy & Performance': ['token_accuracy'],
             'Adaptive Behavior': ['difficulty_expert_correlation', 'expert_usage_entropy']
         }
         

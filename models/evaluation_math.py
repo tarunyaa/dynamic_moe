@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from scipy import stats
 import psutil
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,7 +27,9 @@ class ModelEvaluator:
         max_length: int = 512,
         batch_size: int = 8,
         device: Optional[str] = None,
-        task_type: str = "language_modeling"  # or "qa"
+        task_type: str = "language_modeling",  # or "qa"
+        num_workers: int = 4,
+        cache_dir: Optional[str] = None
     ):
         """
         Initialize the ModelEvaluator with models and dataset.
@@ -38,6 +41,8 @@ class ModelEvaluator:
             batch_size: Batch size for evaluation
             device: Device to run evaluation on (cuda/cpu)
             task_type: Type of task ("language_modeling" or "qa")
+            num_workers: Number of workers for parallel processing
+            cache_dir: Directory to cache model and tokenizer
         """
         self.models = models
         self.dataset = dataset
@@ -46,12 +51,23 @@ class ModelEvaluator:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.task_type = task_type
         self.results = defaultdict(dict)
+        self.num_workers = num_workers
+        self.cache_dir = cache_dir
         
     def _prepare_model(self, model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
         """Load and prepare model and tokenizer."""
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            ).to(self.device)
             model.eval()
             
             # Set up padding token if not already set
@@ -139,59 +155,28 @@ class ModelEvaluator:
             step_accuracy = 0
             total_steps = 0
             
-            for i in tqdm(range(0, len(self.dataset), self.batch_size),
-                         desc=f"Computing GSM8K accuracy for {model_id}"):
-                batch = self.dataset[i:i + self.batch_size]
-                questions = batch['question']
-                answers = batch['answer']
+            # Process in parallel batches
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
                 
-                try:
-                    # Format the prompt for GSM8K
-                    prompts = [f"Question: {q}\nLet's think step by step.\n" for q in questions]
-                    
-                    encoded = tokenizer(
-                        prompts,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.max_length,
-                        padding=True
-                    ).to(self.device)
-                    
-                    with torch.no_grad():
-                        outputs = model.generate(
-                            **encoded,
-                            max_length=self.max_length,
-                            num_return_sequences=1,
-                            temperature=0.7,
-                            do_sample=True
-                        )
-                        
-                        generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                        
-                        # Evaluate each response
-                        for gen_text, true_answer in zip(generated_texts, answers):
-                            # Extract the final answer from generated text
-                            gen_answer = self._extract_final_answer(gen_text)
-                            # Extract the final answer from true answer
-                            true_final = self._extract_final_answer(true_answer)
-                            
-                            if gen_answer and true_final:
-                                total += 1
-                                if self._compare_answers(gen_answer, true_final):
-                                    correct += 1
-                                
-                                # Count correct steps
-                                gen_steps = self._extract_steps(gen_text)
-                                true_steps = self._extract_steps(true_answer)
-                                if gen_steps and true_steps:
-                                    step_matches = sum(1 for g, t in zip(gen_steps, true_steps) 
-                                                     if self._compare_answers(g, t))
-                                    step_accuracy += step_matches
-                                    total_steps += len(true_steps)
-                            
-                except Exception as e:
-                    logger.warning(f"Error processing batch {i}: {str(e)}")
-                    continue
+                for i in range(0, len(self.dataset), self.batch_size):
+                    batch = self.dataset[i:i + self.batch_size]
+                    futures.append(executor.submit(
+                        self._process_gsm8k_batch,
+                        batch, tokenizer, model
+                    ))
+                
+                # Collect results
+                for future in tqdm(futures, desc="Processing batches"):
+                    try:
+                        batch_results = future.result()
+                        total += batch_results['total']
+                        correct += batch_results['correct']
+                        step_accuracy += batch_results['step_accuracy']
+                        total_steps += batch_results['total_steps']
+                    except Exception as e:
+                        logger.warning(f"Error processing batch: {str(e)}")
+                        continue
             
             if total > 0:
                 metrics['final_answer_accuracy'] = correct / total
@@ -235,6 +220,68 @@ class ModelEvaluator:
             metrics['token_accuracy'] = correct / total if total > 0 else 0.0
         
         return metrics
+
+    def _process_gsm8k_batch(self, batch, tokenizer, model):
+        """Process a single batch of GSM8K questions."""
+        results = {
+            'total': 0,
+            'correct': 0,
+            'step_accuracy': 0,
+            'total_steps': 0
+        }
+        
+        try:
+            questions = batch['question']
+            answers = batch['answer']
+            
+            # Format the prompt for GSM8K
+            prompts = [f"Question: {q}\nLet's think step by step.\n" for q in questions]
+            
+            encoded = tokenizer(
+                prompts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+                padding=True
+            ).to(self.device)
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    **encoded,
+                    max_length=self.max_length,
+                    num_return_sequences=1,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=tokenizer.pad_token_id
+                )
+                
+                generated_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                
+                # Evaluate each response
+                for gen_text, true_answer in zip(generated_texts, answers):
+                    # Extract the final answer from generated text
+                    gen_answer = self._extract_final_answer(gen_text)
+                    # Extract the final answer from true answer
+                    true_final = self._extract_final_answer(true_answer)
+                    
+                    if gen_answer and true_final:
+                        results['total'] += 1
+                        if self._compare_answers(gen_answer, true_final):
+                            results['correct'] += 1
+                        
+                        # Count correct steps
+                        gen_steps = self._extract_steps(gen_text)
+                        true_steps = self._extract_steps(true_answer)
+                        if gen_steps and true_steps:
+                            step_matches = sum(1 for g, t in zip(gen_steps, true_steps) 
+                                             if self._compare_answers(g, t))
+                            results['step_accuracy'] += step_matches
+                            results['total_steps'] += len(true_steps)
+        
+        except Exception as e:
+            logger.warning(f"Error processing batch: {str(e)}")
+        
+        return results
 
     def _extract_final_answer(self, text: str) -> str:
         """Extract the final answer from GSM8K response."""
