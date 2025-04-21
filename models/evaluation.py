@@ -24,7 +24,7 @@ class ModelEvaluator:
         models: Dict[str, str],
         dataset: Dataset,
         max_length: int = 512,
-        batch_size: int = 8,
+        batch_size: int = 2,
         device: Optional[str] = None,
         task_type: str = "language_modeling"  # or "qa"
     ):
@@ -47,12 +47,29 @@ class ModelEvaluator:
         self.task_type = task_type
         self.results = defaultdict(dict)
         
+        # Clear CUDA cache if using GPU
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        
     def _prepare_model(self, model_id: str) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
         """Load and prepare model and tokenizer."""
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                cache_dir=self.cache_dir,
+                local_files_only=False,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            ).to(self.device)
             model.eval()
+            
+            # Clear CUDA cache after model loading
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
             
             # Set up padding token if not already set
             if tokenizer.pad_token is None:
